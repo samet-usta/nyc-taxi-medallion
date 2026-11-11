@@ -1,0 +1,12 @@
+services:
+  spark:
+    image: quay.io/jupyter/pyspark-notebook@sha256:6b48d2a6ba3a8c61da576dce264bfaa96838e06c43f2d1e3fcf58ceb15afdbbf
+    container_name: nyc-taxi-spark
+    ports:
+      - "8888:8888"   # Jupyter
+      - "4040:4040"   # Spark UI
+    volumes:
+      - ./:/home/jovyan/work
+    working_dir: /home/jovyan/work
+    environment:
+      - JUPYTER_TOKEN=nyctaxi
