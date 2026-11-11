@@ -15,6 +15,10 @@ RAW_DIR = DATA_DIR / "raw"
 BRONZE_DIR = DATA_DIR / "bronze"
 SILVER_DIR = DATA_DIR / "silver"
 GOLD_DIR = DATA_DIR / "gold"
+BRONZE_TRIPS_DIR = BRONZE_DIR / "yellow_trips"
+BRONZE_ZONES_DIR = BRONZE_DIR / "taxi_zones"
+ZONE_LOOKUP_FILE = RAW_DIR / "taxi_zone_lookup.csv"
+
 
 # Source: NYC TLC Trip Record Data
 BASE_URL = "https://d37ci6vzurychx.cloudfront.net"
