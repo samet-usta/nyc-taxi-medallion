@@ -14,20 +14,39 @@ MAX_SPEED_KMH = 120
 # Captures year (group 1) and month (group 2) from names like yellow_tripdata_2024-01.parquet
 SOURCE_FILE_PATTERN = r"_(\d{4})-(\d{2})\.parquet"
 
+# Source column name -> silver column name (snake_case); unlisted columns keep their names
+COLUMN_RENAMES = {
+    "VendorID": "vendor_id",
+    "tpep_pickup_datetime": "pickup_datetime",
+    "tpep_dropoff_datetime": "dropoff_datetime",
+    "trip_distance": "trip_distance_miles",
+    "RatecodeID": "ratecode_id",
+    "PULocationID": "pickup_location_id",
+    "DOLocationID": "dropoff_location_id",
+    "Airport_fee": "airport_fee",
+}
+
+
 def read_bronze_trips(spark: SparkSession) -> DataFrame:
     """Read the bronze trip table."""
     df_bronze_trips = spark.read.parquet(str(BRONZE_TRIPS_DIR))
     return df_bronze_trips
 
 
+def standardize_column_names(df: DataFrame) -> DataFrame:
+    """Rename source columns to snake_case using COLUMN_RENAMES."""
+    df_renamed = df.withColumnsRenamed(COLUMN_RENAMES)
+    return df_renamed
+
+
 def add_rule_columns(df_trips: DataFrame) -> DataFrame:
     """Add the columns needed by the cleaning rules (km, minutes, km/h, months)."""
-    duration_min = (F.unix_timestamp("tpep_dropoff_datetime") - F.unix_timestamp("tpep_pickup_datetime")) / 60
-    distance_km = F.col("trip_distance") * MILES_TO_KM
-    
+    duration_min = (F.unix_timestamp("dropoff_datetime") - F.unix_timestamp("pickup_datetime")) / 60
+    distance_km = F.col("trip_distance_miles") * MILES_TO_KM
+
     # try_divide returns null instead of failing on zero duration (ANSI mode)
     speed_kmh = F.try_divide(distance_km, duration_min / 60)
-    
+
     file_year = F.regexp_extract("_source_file", SOURCE_FILE_PATTERN, 1).cast("int")
     file_month = F.regexp_extract("_source_file", SOURCE_FILE_PATTERN, 2).cast("int")
 
@@ -36,8 +55,8 @@ def add_rule_columns(df_trips: DataFrame) -> DataFrame:
         .withColumn("trip_distance_km", distance_km)
         .withColumn("trip_duration_min", duration_min)
         .withColumn("avg_speed_kmh", speed_kmh)
-        .withColumn("pickup_year", F.year("tpep_pickup_datetime"))
-        .withColumn("pickup_month", F.month("tpep_pickup_datetime"))
+        .withColumn("pickup_year", F.year("pickup_datetime"))
+        .withColumn("pickup_month", F.month("pickup_datetime"))
         .withColumn("file_year", file_year)
         .withColumn("file_month", file_month)
     )
@@ -87,6 +106,7 @@ def report_rule_counts(df: DataFrame, rules: dict, drop_condition) -> int:
         print(f"  {column_name}: {rule_count:,} ({rule_pct:.2f}%)")
     return row_counts["any_rule"]
 
+
 def apply_rules(df: DataFrame, drop_condition) -> DataFrame:
     """Keep only the rows that match none of the rules."""
     # A rule that evaluates to null counts as "not matched", same as in the report
@@ -110,6 +130,16 @@ def remove_duplicates(df: DataFrame, source_columns: list[str]) -> DataFrame:
     return df_unique
 
 
+def add_derived_columns(df: DataFrame) -> DataFrame:
+    """Add pickup date and hour for analysis and gold aggregations."""
+    df_with_derived_columns = (
+        df
+        .withColumn("pickup_date", F.to_date("pickup_datetime"))
+        .withColumn("pickup_hour", F.hour("pickup_datetime"))
+    )
+    return df_with_derived_columns
+
+
 def main():
     spark = get_spark("nyc-taxi-silver")
 
@@ -117,11 +147,15 @@ def main():
     bronze_count = df_bronze_trips.count()
     print(f"[ok] bronze trips: {bronze_count:,} rows")
 
-    df_with_rule_columns = add_rule_columns(df_bronze_trips)
+    df_trips = standardize_column_names(df_bronze_trips)
+    # Taken before the rule columns are added, so only the 19 source columns are listed
+    source_columns = get_source_columns(df_trips)
+
+    df_with_rule_columns = add_rule_columns(df_trips)
 
     rules = build_rules()
     drop_condition = build_drop_condition(rules)
-    
+
     rules_dropped_count = report_rule_counts(df_with_rule_columns, rules, drop_condition)
 
     df_kept = apply_rules(df_with_rule_columns, drop_condition)
@@ -133,15 +167,14 @@ def main():
         )
     print(f"[ok] dropped by rules: {filtered_count:,} rows (report = filter)")
 
-    source_columns = get_source_columns(df_bronze_trips)
     df_unique = remove_duplicates(df_kept, source_columns)
-    df_silver = df_unique.drop("file_year", "file_month")
+    df_without_file_columns = df_unique.drop("file_year", "file_month")
+    df_silver = add_derived_columns(df_without_file_columns)
 
     silver_count = df_silver.count()
     duplicates_count = kept_count - silver_count
     print(f"[data quality] duplicates removed: {duplicates_count:,}")
     print(f"[ok] silver trips: {silver_count:,} rows")
-    
 
     spark.stop()
 
