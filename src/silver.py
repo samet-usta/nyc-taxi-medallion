@@ -1,6 +1,6 @@
 """Silver layer: clean bronze trips and report data quality per rule."""
 
-from pyspark.sql import DataFrame, SparkSession
+from pyspark.sql import Column, DataFrame, SparkSession
 from pyspark.sql import functions as F
 
 from config import BRONZE_TRIPS_DIR
@@ -26,6 +26,29 @@ COLUMN_RENAMES = {
     "Airport_fee": "airport_fee",
 }
 
+# Code -> description, from the TLC Yellow Taxi data dictionary (March 2025)
+PAYMENT_TYPE_DESCRIPTIONS = {
+    0: "Flex Fare",
+    1: "Credit card",
+    2: "Cash",
+    3: "No charge",
+    4: "Dispute",
+    5: "Unknown",
+    6: "Voided trip",
+}
+
+RATECODE_DESCRIPTIONS = {
+    1: "Standard rate",
+    2: "JFK",
+    3: "Newark",
+    4: "Nassau or Westchester",
+    5: "Negotiated fare",
+    6: "Group ride",
+    99: "Unknown",
+}
+
+# Codes missing from the dictionaries get this value, so new codes are easy to spot
+UNMAPPED_DESCRIPTION = "Unmapped"
 
 def read_bronze_trips(spark: SparkSession) -> DataFrame:
     """Read the bronze trip table."""
@@ -140,6 +163,29 @@ def add_derived_columns(df: DataFrame) -> DataFrame:
     return df_with_derived_columns
 
 
+def map_code_to_description(code_column: str, descriptions: dict) -> Column:
+    """Build a CASE WHEN expression that turns codes into descriptions."""
+    code = F.col(code_column)
+    # Null must be caught first: null == 1 is null, so it would fall through to "Unmapped"
+    description = F.when(code.isNull(), F.lit(None).cast("string"))
+    for code_value, text in descriptions.items():
+        description = description.when(code == code_value, text)
+    description = description.otherwise(UNMAPPED_DESCRIPTION)
+    return description
+
+
+def add_code_descriptions(df: DataFrame) -> DataFrame:
+    """Add readable descriptions for payment_type and ratecode_id."""
+    payment_type_desc = map_code_to_description("payment_type", PAYMENT_TYPE_DESCRIPTIONS)
+    ratecode_desc = map_code_to_description("ratecode_id", RATECODE_DESCRIPTIONS)
+    df_with_descriptions = (
+        df
+        .withColumn("payment_type_desc", payment_type_desc)
+        .withColumn("ratecode_desc", ratecode_desc)
+    )
+    return df_with_descriptions
+
+
 def main():
     spark = get_spark("nyc-taxi-silver")
 
@@ -169,12 +215,15 @@ def main():
 
     df_unique = remove_duplicates(df_kept, source_columns)
     df_without_file_columns = df_unique.drop("file_year", "file_month")
-    df_silver = add_derived_columns(df_without_file_columns)
+
+    df_with_derived_columns = add_derived_columns(df_without_file_columns)
+    df_silver = add_code_descriptions(df_with_derived_columns)
 
     silver_count = df_silver.count()
     duplicates_count = kept_count - silver_count
     print(f"[data quality] duplicates removed: {duplicates_count:,}")
     print(f"[ok] silver trips: {silver_count:,} rows")
+
 
     spark.stop()
 
