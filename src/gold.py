@@ -11,7 +11,7 @@ HOURLY_DEMAND_TABLE = "hourly_demand"
 PAYMENT_TYPE_SUMMARY_TABLE = "payment_type_summary"
 # Cash tips are not recorded in the source (TLC data dictionary); their tip rate is shown as null
 PAYMENT_TYPES_WITHOUT_TIP_DATA = [2]
-
+ROUTE_SUMMARY_TABLE = "route_summary"
 
 def read_silver_trips(spark: SparkSession) -> DataFrame:
     """Read the silver trip table."""
@@ -111,6 +111,20 @@ def build_payment_type_summary(df_silver: DataFrame) -> DataFrame:
     return df_payment_type_summary
 
 
+def build_route_summary(df_silver: DataFrame) -> DataFrame:
+    """Aggregate trips by pickup and dropoff zone using Spark SQL (excludes zone 264)."""
+    df_silver.createOrReplaceTempView("v_silver_trips")
+    df_routes = df_silver.sparkSession.sql("""
+        select pickup_location_id,pickup_borough,pickup_zone,dropoff_location_id,dropoff_borough,dropoff_zone,
+        count(*) as trip_count, round(avg(trip_distance_km),2) as avg_distance_km, round(avg(trip_duration_min),2) as avg_duration_min, 
+        round(sum(total_amount),2) as total_revenue, round(avg(total_amount),2) as avg_revenue_per_trip
+        from v_silver_trips where (pickup_location_id <> 264 and dropoff_location_id <> 264)
+        group by pickup_location_id,pickup_borough,pickup_zone,dropoff_location_id,dropoff_borough,dropoff_zone
+        order by trip_count desc,total_revenue desc,pickup_location_id asc,dropoff_location_id asc
+        """)
+    return df_routes
+
+
 def write_gold_table(df: DataFrame, table_name: str) -> None:
     """Write a gold table as Parquet under GOLD_DIR/<table_name>; overwrite keeps reruns idempotent."""
     target_dir = GOLD_DIR / table_name
@@ -139,14 +153,14 @@ def verify_gold_table(spark: SparkSession, df_expected: DataFrame, table_name: s
     return df_written
 
 
-def check_trip_total(df_gold: DataFrame, silver_count: int, table_name: str) -> None:
-    """Fail if trip_count does not add up to the silver row count (no trips lost or duplicated)."""
+def check_trip_total(df_gold: DataFrame, expected_count: int, table_name: str) -> None:
+    """Fail if trip_count does not add up to the expected row count (no trips lost or duplicated)."""
     row_totals = df_gold.agg(F.sum("trip_count").alias("total_trips")).first()
     total_trips = row_totals["total_trips"]
-    if total_trips != silver_count:
-        raise ValueError(f"{table_name} trip total {total_trips:,} != silver {silver_count:,}")
-    print(f"[ok] {table_name}: trip_count total {total_trips:,} = silver")
-
+    if total_trips != expected_count:
+        raise ValueError(f"{table_name} trip total {total_trips:,} != expected {expected_count:,}")
+    print(f"[ok] {table_name}: trip_count total {total_trips:,} = expected")
+    
 
 def main():
     spark = get_spark("nyc-taxi-gold")
@@ -170,6 +184,12 @@ def main():
     write_gold_table(df_payment_type_summary, PAYMENT_TYPE_SUMMARY_TABLE)
     df_written_payment = verify_gold_table(spark, df_payment_type_summary, PAYMENT_TYPE_SUMMARY_TABLE)
     check_trip_total(df_written_payment, silver_count, PAYMENT_TYPE_SUMMARY_TABLE)
+
+    df_route_summary = build_route_summary(df_silver)
+    write_gold_table(df_route_summary, ROUTE_SUMMARY_TABLE)
+    df_written_routes = verify_gold_table(spark, df_route_summary, ROUTE_SUMMARY_TABLE)
+    routes_expected_count = df_silver.filter((F.col("pickup_location_id") != 264) & (F.col("dropoff_location_id") != 264)).count()
+    check_trip_total(df_written_routes, routes_expected_count, ROUTE_SUMMARY_TABLE)
 
     spark.stop()
 
