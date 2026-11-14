@@ -3,7 +3,7 @@
 from pyspark.sql import Column, DataFrame, SparkSession
 from pyspark.sql import functions as F
 
-from config import BRONZE_TRIPS_DIR, BRONZE_ZONES_DIR
+from config import BRONZE_TRIPS_DIR, BRONZE_ZONES_DIR , SILVER_TRIPS_DIR 
 from spark_session import get_spark
 
 
@@ -222,6 +222,44 @@ def add_zone_columns(df: DataFrame, df_zones: DataFrame, location_prefix: str) -
     return df_with_zones
 
 
+def write_silver_trips(df):
+    """Write silver trips as Parquet; overwrite makes reruns idempotent."""
+    df.write.mode("overwrite").parquet(str(SILVER_TRIPS_DIR))
+    print(f"[ok] silver written: {SILVER_TRIPS_DIR}")
+
+
+def verify_silver_trips(spark, df_expected):
+    """Read silver back from disk; count and schema must match the in-memory DataFrame."""
+    df_written = spark.read.parquet(str(SILVER_TRIPS_DIR))
+
+    written_count = df_written.count()
+    expected_count = df_expected.count()
+    if written_count != expected_count:
+        raise ValueError(f"Count mismatch: written={written_count:,}, expected={expected_count:,}")
+
+    # Compare name + type only: Parquet read-back marks every column nullable
+    written_fields = [(f.name, f.dataType) for f in df_written.schema.fields]
+    expected_fields = [(f.name, f.dataType) for f in df_expected.schema.fields]
+    if written_fields != expected_fields:
+        raise ValueError("Schema mismatch between written and expected silver")
+
+    print(f"[ok] silver read-back: {written_count:,} rows, {len(written_fields)} columns")
+    return written_count
+
+
+def check_reconciliation(bronze_count, silver_count, rules_dropped_count, duplicates_count):
+    """Every bronze row must be accounted for: kept in silver or dropped for a known reason."""
+    accounted = silver_count + rules_dropped_count + duplicates_count
+    if bronze_count != accounted:
+        raise ValueError(
+            f"Reconciliation failed: bronze={bronze_count:,}, accounted={accounted:,}"
+        )
+    print(
+        f"[ok] reconciliation: bronze {bronze_count:,} = silver {silver_count:,}"
+        f" + rules {rules_dropped_count:,} + duplicates {duplicates_count:,}"
+    )
+
+
 def main():
     spark = get_spark("nyc-taxi-silver")
 
@@ -266,6 +304,10 @@ def main():
     print(f"[data quality] duplicates removed: {duplicates_count:,}")
     print(f"[ok] silver trips: {silver_count:,} rows")
 
+    write_silver_trips(df_silver)
+    written_count = verify_silver_trips(spark, df_silver)
+
+    check_reconciliation(bronze_count, written_count, filtered_count, duplicates_count)
 
     spark.stop()
 
