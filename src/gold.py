@@ -1,6 +1,6 @@
 """Gold layer: build business-level aggregate tables from silver trips."""
 
-from pyspark.sql import DataFrame, SparkSession
+from pyspark.sql import DataFrame, SparkSession, Window
 from pyspark.sql import functions as F
 
 from config import GOLD_DIR, SILVER_TRIPS_DIR
@@ -8,6 +8,10 @@ from spark_session import get_spark
 
 DAILY_ZONE_REVENUE_TABLE = "daily_zone_revenue"
 HOURLY_DEMAND_TABLE = "hourly_demand"
+PAYMENT_TYPE_SUMMARY_TABLE = "payment_type_summary"
+# Cash tips are not recorded in the source (TLC data dictionary); their tip rate is shown as null
+PAYMENT_TYPES_WITHOUT_TIP_DATA = [2]
+
 
 def read_silver_trips(spark: SparkSession) -> DataFrame:
     """Read the silver trip table."""
@@ -61,6 +65,50 @@ def build_hourly_demand(df_silver: DataFrame) -> DataFrame:
         .orderBy("pickup_day_of_week", "pickup_hour")
     )
     return df_hourly_demand
+
+
+def build_payment_type_summary(df_silver: DataFrame) -> DataFrame:
+    """Trip share, average fare and tip, and tip rate per payment type."""
+    # Totals are kept for the tip rate and dropped by the final select
+    df_counts = (
+        df_silver
+        .groupBy("payment_type", "payment_type_desc")
+        .agg(
+            F.count("*").alias("trip_count"),
+            F.round(F.avg("fare_amount"), 2).alias("avg_fare_amount"),
+            F.round(F.avg("tip_amount"), 2).alias("avg_tip_amount"),
+            F.sum("fare_amount").alias("total_fare_amount"),
+            F.sum("tip_amount").alias("total_tip_amount"),
+        )
+    )
+
+    # Empty partitionBy: the whole table is one window, like SUM(trip_count) OVER ()
+    all_rows = Window.partitionBy()
+    trip_share = F.col("trip_count") / F.sum("trip_count").over(all_rows) * 100
+    trip_share_pct = F.round(trip_share, 2)
+
+    # Ratio of sums: a single small fare with a large tip cannot distort the rate
+    tip_rate = F.try_divide(F.col("total_tip_amount"), F.col("total_fare_amount")) * 100
+    has_no_tip_data = F.col("payment_type").isin(PAYMENT_TYPES_WITHOUT_TIP_DATA)
+    # Null means "no data", not "no tip"
+    tip_rate_pct = F.when(has_no_tip_data, F.lit(None).cast("double")).otherwise(F.round(tip_rate, 2))
+
+    df_payment_type_summary = (
+        df_counts
+        .withColumn("trip_share_pct", trip_share_pct)
+        .withColumn("tip_rate_pct", tip_rate_pct)
+        .select(
+            "payment_type",
+            "payment_type_desc",
+            "trip_count",
+            "trip_share_pct",
+            "avg_fare_amount",
+            "avg_tip_amount",
+            "tip_rate_pct",
+        )
+        .orderBy(F.desc("trip_count"))
+    )
+    return df_payment_type_summary
 
 
 def write_gold_table(df: DataFrame, table_name: str) -> None:
@@ -117,6 +165,11 @@ def main():
     write_gold_table(df_hourly_demand, HOURLY_DEMAND_TABLE)
     df_written_hourly = verify_gold_table(spark, df_hourly_demand, HOURLY_DEMAND_TABLE)
     check_trip_total(df_written_hourly, silver_count, HOURLY_DEMAND_TABLE)
+
+    df_payment_type_summary = build_payment_type_summary(df_silver)
+    write_gold_table(df_payment_type_summary, PAYMENT_TYPE_SUMMARY_TABLE)
+    df_written_payment = verify_gold_table(spark, df_payment_type_summary, PAYMENT_TYPE_SUMMARY_TABLE)
+    check_trip_total(df_written_payment, silver_count, PAYMENT_TYPE_SUMMARY_TABLE)
 
     spark.stop()
 
