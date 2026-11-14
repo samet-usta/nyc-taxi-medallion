@@ -7,7 +7,7 @@ from config import GOLD_DIR, SILVER_TRIPS_DIR
 from spark_session import get_spark
 
 DAILY_ZONE_REVENUE_TABLE = "daily_zone_revenue"
-
+HOURLY_DEMAND_TABLE = "hourly_demand"
 
 def read_silver_trips(spark: SparkSession) -> DataFrame:
     """Read the silver trip table."""
@@ -29,6 +29,38 @@ def build_daily_zone_revenue(df_silver: DataFrame) -> DataFrame:
         .orderBy("pickup_date", "pickup_location_id")
     )
     return df_daily_zone_revenue
+
+
+def build_hourly_demand(df_silver: DataFrame) -> DataFrame:
+    """Trips per day of week and pickup hour, with the average number of trips per day."""
+    # weekday() returns 0 = Monday; +1 gives ISO numbering (1 = Monday ... 7 = Sunday)
+    day_of_week = F.weekday("pickup_date") + 1
+    day_name = F.date_format("pickup_date", "EEEE")
+
+    df_with_day = (
+        df_silver
+        .withColumn("pickup_day_of_week", day_of_week)
+        .withColumn("pickup_day_name", day_name)
+    )
+
+    # Day name follows from the day number, so it does not change the number of groups
+    df_counts = (
+        df_with_day
+        .groupBy("pickup_day_of_week", "pickup_day_name", "pickup_hour")
+        .agg(
+            F.count("*").alias("trip_count"),
+            # Weekdays can occur a different number of times in a period; this keeps averages fair
+            F.countDistinct("pickup_date").alias("day_count"),
+        )
+    )
+
+    avg_trips_per_day = F.round(F.col("trip_count") / F.col("day_count"), 2)
+    df_hourly_demand = (
+        df_counts
+        .withColumn("avg_trips_per_day", avg_trips_per_day)
+        .orderBy("pickup_day_of_week", "pickup_hour")
+    )
+    return df_hourly_demand
 
 
 def write_gold_table(df: DataFrame, table_name: str) -> None:
@@ -80,6 +112,11 @@ def main():
     write_gold_table(df_daily_zone_revenue, DAILY_ZONE_REVENUE_TABLE)
     df_written_daily = verify_gold_table(spark, df_daily_zone_revenue, DAILY_ZONE_REVENUE_TABLE)
     check_trip_total(df_written_daily, silver_count, DAILY_ZONE_REVENUE_TABLE)
+
+    df_hourly_demand = build_hourly_demand(df_silver)
+    write_gold_table(df_hourly_demand, HOURLY_DEMAND_TABLE)
+    df_written_hourly = verify_gold_table(spark, df_hourly_demand, HOURLY_DEMAND_TABLE)
+    check_trip_total(df_written_hourly, silver_count, HOURLY_DEMAND_TABLE)
 
     spark.stop()
 
