@@ -3,8 +3,9 @@
 from pyspark.sql import Column, DataFrame, SparkSession
 from pyspark.sql import functions as F
 
-from config import BRONZE_TRIPS_DIR
+from config import BRONZE_TRIPS_DIR, BRONZE_ZONES_DIR
 from spark_session import get_spark
+
 
 MILES_TO_KM = 1.609344
 MAX_DURATION_MIN = 180
@@ -54,6 +55,12 @@ def read_bronze_trips(spark: SparkSession) -> DataFrame:
     """Read the bronze trip table."""
     df_bronze_trips = spark.read.parquet(str(BRONZE_TRIPS_DIR))
     return df_bronze_trips
+
+
+def read_bronze_zones(spark: SparkSession) -> DataFrame:
+    """Read the bronze taxi zone lookup table."""
+    df_zones = spark.read.parquet(str(BRONZE_ZONES_DIR))
+    return df_zones
 
 
 def standardize_column_names(df: DataFrame) -> DataFrame:
@@ -186,6 +193,35 @@ def add_code_descriptions(df: DataFrame) -> DataFrame:
     return df_with_descriptions
 
 
+def check_zone_ids_unique(df_zones: DataFrame) -> None:
+    """Fail fast if LocationID repeats: a repeated key would multiply trip rows in the join."""
+    zone_count = df_zones.count()
+    distinct_id_count = df_zones.select("LocationID").distinct().count()
+    if zone_count != distinct_id_count:
+        raise ValueError(
+            f"Duplicate LocationID in zone lookup: rows={zone_count}, distinct={distinct_id_count}"
+        )
+    print(f"[ok] zone lookup: {zone_count} rows, LocationID is unique")
+
+
+def add_zone_columns(df: DataFrame, df_zones: DataFrame, location_prefix: str) -> DataFrame:
+    """Add borough and zone names for one location column (pickup or dropoff)."""
+    location_column = f"{location_prefix}_location_id"
+
+    # Renamed before the join, so pickup and dropoff columns never clash
+    df_prefixed_zones = df_zones.select(
+        F.col("LocationID").alias("zone_location_id"),
+        F.col("Borough").alias(f"{location_prefix}_borough"),
+        F.col("Zone").alias(f"{location_prefix}_zone"),
+    )
+
+    join_condition = F.col(location_column) == F.col("zone_location_id")
+    # Left join keeps every trip; broadcast sends the small lookup to every executor (no shuffle)
+    df_joined = df.join(F.broadcast(df_prefixed_zones), join_condition, "left")
+    df_with_zones = df_joined.drop("zone_location_id")
+    return df_with_zones
+
+
 def main():
     spark = get_spark("nyc-taxi-silver")
 
@@ -217,7 +253,13 @@ def main():
     df_without_file_columns = df_unique.drop("file_year", "file_month")
 
     df_with_derived_columns = add_derived_columns(df_without_file_columns)
-    df_silver = add_code_descriptions(df_with_derived_columns)
+
+    df_with_descriptions = add_code_descriptions(df_with_derived_columns)
+
+    df_bronze_zones = read_bronze_zones(spark)
+    check_zone_ids_unique(df_bronze_zones)
+    df_with_pickup_zones = add_zone_columns(df_with_descriptions, df_bronze_zones, "pickup")
+    df_silver = add_zone_columns(df_with_pickup_zones, df_bronze_zones, "dropoff")
 
     silver_count = df_silver.count()
     duplicates_count = kept_count - silver_count
