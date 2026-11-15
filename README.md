@@ -34,7 +34,7 @@ Python · PySpark 4.3.0 · Spark SQL · Parquet · Docker / Docker Compose · Ju
 Requirements: Docker Desktop, Git.
 
 ```bash
-git clone git@github.com:<sametustaa>/nyc-taxi-medallion.git
+git clone https://github.com/samet-usta/nyc-taxi-medallion.git
 cd nyc-taxi-medallion
 docker compose up -d
 
